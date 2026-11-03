@@ -35,6 +35,7 @@ final class DDCService: ObservableObject, @unchecked Sendable {
     // VCP feature codes (DDC/CI standard)
     static let brightnessVCP: UInt8 = 0x10
     static let volumeVCP: UInt8     = 0x62
+    static let muteVCP: UInt8       = 0x8D
 
     /// See docs/ddc-notes.md for log categories. Serials never appear in logs.
     private static let log = Logger(subsystem: "com.crisp.app", category: "ddc")

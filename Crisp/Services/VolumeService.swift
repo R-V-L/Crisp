@@ -6,9 +6,11 @@ import os.log
 
 /// DDC/CI speaker volume (VCP 0x62) for external monitors (issue #23):
 /// support probing, a coalesced writer, mute, and default-audio-output
-/// matching for the volume keys. Mute is modeled as "volume 0 + remembered
-/// previous level", which works on every monitor that answers 0x62.
-/// ponytail: real VCP 0x8D mute is the upgrade if monitors misbehave on 0.
+/// matching for the volume keys. Mute uses the monitor's own VCP 0x8D when it
+/// reports a known range, keeping 0x62 at the pre-mute level; panels that treat
+/// 0x62 = 0 as a jump to loud (Acer G257HU, Samsung LS27A800U) therefore never
+/// see a zero volume. Monitors without 0x8D fall back to 0x62 = 1, the quiet
+/// floor measured on those panels.
 @MainActor
 final class VolumeService: ObservableObject {
     static let shared = VolumeService()
@@ -19,8 +21,16 @@ final class VolumeService: ObservableObject {
     /// DDC max volume per display (usually 100), from the probe read through
     /// DDCVolumeMax.
     private var ddcMax: [CGDirectDisplayID: UInt16] = [:]
-    /// Volume to restore on unmute, captured when toggleMute drops to zero.
+    /// Volume to restore on unmute, captured when mute drops to zero.
     private var preMuteVolume: [CGDirectDisplayID: Double] = [:]
+    /// VCP 0x8D mute values per display, nil until a probe confirms the shape.
+    private var muteValues: [CGDirectDisplayID: DDCMuteValues] = [:]
+    /// Displays muted through 0x8D, or through the 0x62 = 1 fallback.
+    private var muted: Set<CGDirectDisplayID> = []
+    /// Monotonic token per display, bumped by every user volume action. A probe
+    /// that started before the action must not overwrite the UI when it lands.
+    private var userGeneration: [CGDirectDisplayID: UInt64] = [:]
+    private var nextGeneration: UInt64 = 0
 
     /// UUIDs of displays that have ever answered a 0x62 read. VCP support is a
     /// hardware fact, so remember it: a flaky launch-time probe (the
@@ -64,6 +74,14 @@ final class VolumeService: ObservableObject {
     func invalidate(for displayID: CGDirectDisplayID) {
         ddcMax.removeValue(forKey: displayID)
         preMuteVolume.removeValue(forKey: displayID)
+        muteValues.removeValue(forKey: displayID)
+        muted.remove(displayID)
+        userGeneration.removeValue(forKey: displayID)
+    }
+
+    private func markUserAction(_ displayID: CGDirectDisplayID) {
+        nextGeneration &+= 1
+        userGeneration[displayID] = nextGeneration
     }
 
     // MARK: - Probe
@@ -81,8 +99,10 @@ final class VolumeService: ObservableObject {
         }
         let id = display.displayID
         let uuid = display.displayUUID
+        let generation = userGeneration[id] ?? 0
         DDCService.shared.readAsync(displayID: id, command: DDCService.volumeVCP) { result in
             Task { @MainActor in
+                guard (self.userGeneration[id] ?? 0) == generation else { return }
                 guard let result else {
                     // Only while the feature is hidden: a remembered or forced
                     // display failing a probe is the DDC layer's line to log.
@@ -98,13 +118,52 @@ final class VolumeService: ObservableObject {
                 self.ddcMax[id] = volumeMax
                 display.volumeSupported = true
                 self.rememberCapable(uuid)
-                // Adopt the hardware level only while our writer is idle, so a
-                // stale cached read never fights an in-flight drag.
-                if self.pending[id] == nil, !self.pumpActive.contains(id) {
-                    display.volume = Double(result.current) / Double(volumeMax) * 100.0
+                let hardwarePercent = Double(result.current) / Double(volumeMax) * 100.0
+                self.readMute(for: display, hardwarePercent: hardwarePercent, generation: generation)
+            }
+        }
+    }
+
+    /// Follows the volume probe with a VCP 0x8D read: it tells whether the
+    /// speakers are muted and whether this panel supports the real mute. A
+    /// missing or unknown reply leaves the volume path on the 0x62 fallback.
+    private func readMute(for display: DisplayInfo, hardwarePercent: Double, generation: UInt64) {
+        let id = display.displayID
+        DDCService.shared.readAsync(displayID: id, command: DDCService.muteVCP) { result in
+            Task { @MainActor in
+                guard (self.userGeneration[id] ?? 0) == generation else { return }
+                guard let result, let values = DDCMuteValues.from(max: result.max) else {
+                    // A failed or unknown 0x8D reply says nothing about mute;
+                    // keep the last known state and just adopt the level.
+                    if !self.muted.contains(id) {
+                        self.adoptHardwareVolume(display, percent: hardwarePercent)
+                    }
+                    return
+                }
+                self.muteValues[id] = values
+                if result.current == values.mute {
+                    self.muted.insert(id)
+                    // Keep 0x62 as the restore target; the slider shows mute.
+                    if self.pending[id] == nil, !self.pumpActive.contains(id) {
+                        if hardwarePercent > 0 {
+                            self.preMuteVolume[id] = hardwarePercent
+                        }
+                        display.volume = 0
+                    }
+                } else {
+                    self.muted.remove(id)
+                    self.adoptHardwareVolume(display, percent: hardwarePercent)
                 }
             }
         }
+    }
+
+    /// Adopts the hardware 0x62 level only while our writer is idle, so a stale
+    /// cached read never fights an in-flight drag.
+    private func adoptHardwareVolume(_ display: DisplayInfo, percent: Double) {
+        let id = display.displayID
+        guard pending[id] == nil, !pumpActive.contains(id) else { return }
+        display.volume = percent
     }
 
     // MARK: - Set (coalesced)
@@ -115,22 +174,58 @@ final class VolumeService: ObservableObject {
 
     /// Sets speaker volume (0–100). Coalesced like the brightness writer:
     /// latest value wins, writes paced to the MCCS ~50ms spacing so slider
-    /// drags don't flood the I2C bus that brightness shares.
+    /// drags don't flood the I2C bus that brightness shares. Zero means mute;
+    /// it never writes 0x62 = 0, which some panels turn into full volume.
     func setVolume(_ percent: Double, for display: DisplayInfo) {
+        markUserAction(display.displayID)
         let clamped = max(0.0, min(100.0, percent))
+        if clamped == 0 {
+            mute(display)
+            return
+        }
+        if muted.contains(display.displayID) {
+            unmute(display)
+        }
         display.volume = clamped
         pending[display.displayID] = clamped
         pump(for: display.displayID)
     }
 
     /// Mute key behavior: at zero, restore the remembered pre-mute level (or
-    /// 25 if there is none); otherwise remember the level and drop to zero.
+    /// 25 if there is none); otherwise remember the level and mute.
     func toggleMute(for display: DisplayInfo) {
-        if display.volume <= 0 {
+        if muted.contains(display.displayID) || display.volume <= 0 {
             setVolume(preMuteVolume[display.displayID] ?? 25, for: display)
         } else {
-            preMuteVolume[display.displayID] = display.volume
             setVolume(0, for: display)
+        }
+    }
+
+    /// Mutes without writing 0x62 = 0. With 0x8D support the hardware stays at
+    /// the pre-mute level and only the mute register changes; otherwise 0x62
+    /// goes to 1, the quiet floor.
+    private func mute(_ display: DisplayInfo) {
+        let id = display.displayID
+        if display.volume > 0 {
+            preMuteVolume[id] = display.volume
+        }
+        display.volume = 0
+        muted.insert(id)
+        pending.removeValue(forKey: id)
+        if let values = muteValues[id] {
+            DDCService.shared.writeAsync(displayID: id, command: DDCService.muteVCP, value: values.mute)
+        } else {
+            DDCService.shared.writeAsync(displayID: id, command: DDCService.volumeVCP, value: 1)
+        }
+    }
+
+    /// Clears the mute flag. The caller follows with the volume write, which
+    /// restores the level on the 0x62 fallback and sets the new level otherwise.
+    private func unmute(_ display: DisplayInfo) {
+        let id = display.displayID
+        guard muted.remove(id) != nil else { return }
+        if let values = muteValues[id] {
+            DDCService.shared.writeAsync(displayID: id, command: DDCService.muteVCP, value: values.unmute)
         }
     }
 

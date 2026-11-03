@@ -66,6 +66,13 @@ read after power-on, garbage within a few) and occasionally recover.
 Writes are reliable except when the controller fully wedges. Treat this
 monitor as write-only; that is what the quarantine effectively does.
 
+**Acer G257HU and Samsung LS27A800U** (HDMI / DisplayPort, measured
+2026-11-03): VCP 0x62 answers a max of 100, but writing 0 jumps the speakers
+to a loud level instead of muting; 1 is quiet. Their real mute is VCP 0x8D:
+both report max 2, where 1 mutes, 2 unmutes, and 0 is ignored. Crisp mutes
+with 0x8D and keeps 0x62 at the pre-mute level; monitors without 0x8D fall
+back to 0x62 = 1.
+
 **Dell U2412M** (DP, portrait): textbook-clean DDC in both directions,
 absent from every quirk database. Two quirks anyway: (1) incoming DDC
 writes auto-dismiss its OSD menu; (2) app brightness traffic while its
