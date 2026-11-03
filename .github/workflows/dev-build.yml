@@ -1,0 +1,46 @@
+name: Dev build
+
+# On-demand DMG build for a fork, so the app can be built without a local
+# Xcode install. `ref` chooses the branch to build while the workflow itself
+# lives on the default branch; `version` should be above the current release
+# (e.g. v9.9.9) so Sparkle does not immediately offer to replace the build.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag to build
+        required: true
+        default: main
+      version:
+        description: Version stamped into the app and DMG
+        required: true
+        default: v9.9.9
+
+permissions:
+  contents: read
+
+jobs:
+  dmg:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install build tools
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen swiftlint
+
+      - name: Check (lint, tests, x86_64, localization)
+        run: make check
+
+      - name: Build DMG
+        run: ./scripts/release.sh "${{ inputs.version }}"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crisp-${{ inputs.version }}
+          path: Crisp.dmg
+          if-no-files-found: error
+          retention-days: 14
